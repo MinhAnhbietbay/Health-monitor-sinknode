@@ -3,6 +3,14 @@
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 
+#include "dense_autoencoder_esp32_int8.h"
+
+// TensorFlow Lite for Microcontrollers
+#include <tensorflow/lite/micro/all_ops_resolver.h>
+#include <tensorflow/lite/micro/micro_interpreter.h>
+#include <tensorflow/lite/micro/micro_error_reporter.h>
+#include <tensorflow/lite/schema/schema_generated.h>
+
 #define MOTOR_PIN 5   // Motor rung khi cảnh báo
 
 // --- WiFi ---
@@ -24,6 +32,26 @@ WiFiUDP udp;
 WiFiClientSecure espClient;
 PubSubClient client(espClient);
 
+// --- TensorFlow Lite ---
+constexpr int kTensorArenaSize = 16 * 1024;
+uint8_t tensor_arena[kTensorArenaSize];
+
+const tflite::Model* model_tflite = tflite::GetModel(dense_autoencoder_esp32_int8_tflite);
+tflite::AllOpsResolver resolver;             
+tflite::MicroInterpreter* interpreter;
+tflite::MicroErrorReporter micro_error_reporter;
+
+TfLiteTensor* input;
+TfLiteTensor* output;
+
+// --- Parameters ---
+#define TIME_STEPS 10
+#define N_FEATURES 11
+const float MSE_THRESHOLD = 0.0008969453; // theo mse_threshold_95.npy
+
+float sequence_buffer[TIME_STEPS][N_FEATURES];
+int seq_index = 0;
+
 void reconnectMQTT() {
   while (!client.connected()) {
     Serial.print("MQTT reconnecting...");
@@ -37,30 +65,95 @@ void reconnectMQTT() {
   }
 }
 
+void setupTFLite() {
+  static tflite::MicroInterpreter static_interpreter(
+    model_tflite,
+    resolver,
+    tensor_arena,
+    kTensorArenaSize,
+    &micro_error_reporter
+  );
+  interpreter = &static_interpreter;
+
+  if (interpreter->AllocateTensors() != kTfLiteOk) {
+    Serial.println("AllocateTensors() failed!");
+    while (1);
+  }
+
+  input = interpreter->input(0);
+  output = interpreter->output(0);
+  Serial.println("TFLite setup done!");
+}
+
+float compute_mse() {
+  float mse = 0;
+  for (int i = 0; i < TIME_STEPS; i++) {
+    for (int j = 0; j < N_FEATURES; j++) {
+      int8_t q = output->data.int8[i * N_FEATURES + j];
+      float recon = (q - output->params.zero_point) * output->params.scale;
+      float diff = sequence_buffer[i][j] - recon;
+      mse += diff * diff;
+    }
+  }
+  mse /= (TIME_STEPS * N_FEATURES);
+  return mse;
+}
+
+void process_sequence() {
+  // Convert float -> int8 input
+  for (int i = 0; i < TIME_STEPS; i++) {
+    for (int j = 0; j < N_FEATURES; j++) {
+      int8_t q = (int8_t)(sequence_buffer[i][j] / input->params.scale + input->params.zero_point);
+      if (q > 127) q = 127;
+      if (q < -128) q = -128;
+      input->data.int8[i * N_FEATURES + j] = q;
+    }
+  }
+
+  if (interpreter->Invoke() != kTfLiteOk) {
+    Serial.println("Invoke failed!");
+    return;
+  }
+
+  float mse = compute_mse();
+  Serial.printf("Sequence MSE: %.6f\n", mse);
+
+  if (mse > MSE_THRESHOLD) {
+    digitalWrite(MOTOR_PIN, HIGH);
+    Serial.println("ALERT: Anomaly detected!!!!!!!!!!!");
+    // Publish alert
+    String topic = "channels/" + String(channelID) + "/publish";
+    String payload = "field1=ALERT&field2=" + String(mse);
+    client.publish(topic.c_str(), payload.c_str());
+  } else {
+    digitalWrite(MOTOR_PIN, LOW);
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   pinMode(MOTOR_PIN, OUTPUT);
   digitalWrite(MOTOR_PIN, LOW);
 
-  // --- WiFi ---
-  Serial.println("Connecting to WiFi...");
+  // WiFi
+  Serial.println("Connecting WiFi...");
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
-  Serial.println("\nWiFi connected!");
-  Serial.print("IP: ");
-  Serial.println(WiFi.localIP());
+  Serial.println("\nWiFi connected! IP: " + String(WiFi.localIP()));
 
-  // --- MQTT ---
+  // MQTT
   espClient.setInsecure();
   client.setServer(mqttServer, mqttPort);
 
-  // --- UDP ---
+  // UDP
   udp.begin(udpPort);
-  Serial.print("Listening UDP on port ");
-  Serial.println(udpPort);
+  Serial.printf("Listening UDP on port %d\n", udpPort);
+
+  // TFLite
+  setupTFLite();
 }
 
 void loop() {
@@ -72,12 +165,11 @@ void loop() {
     char packetBuffer[255];
     int len = udp.read(packetBuffer, 255);
     if (len > 0) packetBuffer[len] = '\0';
-
     String data = String(packetBuffer);
     Serial.println("Received: " + data);
 
-    // --- Tách dữ liệu 13 giá trị ---
-    float values[13] = {0};
+    // Parse 12 values: nodeId + 11 features
+    float values[12] = {0};
     int index = 0;
     int lastComma = -1;
     for (int i = 0; i <= data.length(); i++) {
@@ -85,50 +177,23 @@ void loop() {
         String val = data.substring(lastComma + 1, i);
         values[index++] = val.toFloat();
         lastComma = i;
-        if (index >= 13) break;
+        if (index >= 12) break;
       }
     }
 
-    int nodeId = (int)values[0];
-    float tempC = values[1];
-    float accX = values[2], accY = values[3], accZ = values[4];
-    float gyroX = values[5], gyroY = values[6], gyroZ = values[7];
-    float angleX = values[8], angleY = values[9], angleZ = values[10];
-    float hr = values[11], spo2 = values[12];
-
-    // --- Hiển thị Serial ---
-    Serial.printf("Node %d\n", nodeId);
-    Serial.printf("Temp: %.2f°C\n", tempC);
-    Serial.printf("Acc: %.2f, %.2f, %.2f\n", accX, accY, accZ);
-    Serial.printf("Gyro: %.2f, %.2f, %.2f\n", gyroX, gyroY, gyroZ);
-    Serial.printf("Angle: %.2f, %.2f, %.2f\n", angleX, angleY, angleZ);
-    Serial.printf("HR: %.0f, SpO2: %.0f\n", hr, spo2);
-    Serial.println("------------------------------------");
-
-    // --- Rung cảnh báo ---
-    if (tempC > 37.5) {
-      digitalWrite(MOTOR_PIN, HIGH);
-      delay(1000);
-      digitalWrite(MOTOR_PIN, LOW);
-      Serial.println(" Nhiệt độ cao!");
+    // Add to sequence buffer
+    for (int j = 0; j < N_FEATURES; j++) {
+      sequence_buffer[seq_index][j] = values[j + 1]; // skip nodeId
     }
+    seq_index++;
 
-    // --- Publish 7 field lên ThingSpeak ---
-    String topic = "channels/" + String(channelID) + "/publish";
-    String payload = "field1=" + String(nodeId) +
-                     "&field2=" + String(tempC) +
-                     "&field3=" + String(accX) + "," + String(accY) + "," + String(accZ) +
-                     "&field4=" + String(gyroX) + "," + String(gyroY) + "," + String(gyroZ) +
-                     "&field5=" + String(angleX) + "," + String(angleY) + "," + String(angleZ) +
-                     "&field6=" + String(hr) +
-                     "&field7=" + String(spo2);
-
-    if (client.publish(topic.c_str(), payload.c_str())) {
-      Serial.println("Published to ThingSpeak: " + payload);
-    } else {
-      Serial.println("Publish failed!");
+    if (seq_index >= TIME_STEPS) {
+      process_sequence();
+      // shift left buffer 1 step
+      for (int i = 1; i < TIME_STEPS; i++)
+        for (int j = 0; j < N_FEATURES; j++)
+          sequence_buffer[i - 1][j] = sequence_buffer[i][j];
+      seq_index = TIME_STEPS - 1;
     }
   }
-
-  delay(2000);
 }

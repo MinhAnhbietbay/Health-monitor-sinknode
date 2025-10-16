@@ -32,7 +32,7 @@ WiFiClientSecure espClient;
 PubSubClient client(espClient);
 
 // --- TensorFlow Lite ---
-constexpr int kTensorArenaSize = 16 * 1024;
+constexpr int kTensorArenaSize = 32 * 1024;  // tăng để tránh thiếu RAM
 uint8_t tensor_arena[kTensorArenaSize];
 
 const tflite::Model* model_tflite = tflite::GetModel(dense_autoencoder_esp32_int8_tflite);
@@ -46,11 +46,32 @@ TfLiteTensor* output;
 // --- Parameters ---
 #define TIME_STEPS 10
 #define N_FEATURES 11
-const float MSE_THRESHOLD = 0.0008969453;
+float MSE_THRESHOLD = 0.0008080511; // ngưỡng cảnh báo ban đầu
 
 float sequence_buffer[TIME_STEPS][N_FEATURES];
 int seq_index = 0;
 
+// --- Min & Max của 11 đặc trưng
+const float feature_mins[N_FEATURES] = {
+  32.5, -0.140388, -2.000102, -1.2661167,
+  -3.598768, -2.1705351, -3.161072,
+  -179.99988, -89.971024, -179.99937,
+  92.307678
+};
+
+const float feature_maxs[N_FEATURES] = {
+  33.689999, 1.5592226, 0.32112229, 0.1557696,
+  4.330781, 2.648262, 2.375591,
+  179.99944, 89.486946, 179.99696,
+  200.00003
+};
+
+// --- Calibration MSE ---
+float max_mse_normal = 0;
+bool calibrating = true;
+unsigned long calibrate_start = 0;  // thời gian bắt đầu calibrate
+
+// --- Functions ---
 void reconnectMQTT() {
   while (!client.connected()) {
     Serial.print("MQTT reconnecting...");
@@ -86,26 +107,44 @@ void setupTFLite() {
 
 float compute_mse() {
   float mse = 0;
+  int count = 0;
   for (int i = 0; i < TIME_STEPS; i++) {
     for (int j = 0; j < N_FEATURES; j++) {
+      if (j == 9) continue;               // bỏ angleZ
+      if (j == 10 && sequence_buffer[i][j] < -900) continue; // bỏ hr bị mất
       int8_t q = output->data.int8[i * N_FEATURES + j];
       float recon = (q - output->params.zero_point) * output->params.scale;
       float diff = sequence_buffer[i][j] - recon;
       mse += diff * diff;
+      count++;
     }
   }
-  mse /= (TIME_STEPS * N_FEATURES);
-  return mse;
+  if (count == 0) return 0;
+  return mse / count;
 }
 
-void process_sequence(float nodeId, float temp, float accX, float accY, float accZ,
-                      float gyroX, float gyroY, float gyroZ,
-                      float angleX, float angleY, float angleZ,
-                      float hr) {
-  // Convert float -> int8 input
+void process_sequence(float nodeId, float raw_values[N_FEATURES]) {
+  // Chuyển góc sang rad
+  for (int i = 0; i < TIME_STEPS; i++) {
+      sequence_buffer[i][8] = sequence_buffer[i][8] * 3.14159265358979323846 / 180.0; // angleX
+      sequence_buffer[i][9] = sequence_buffer[i][9] * 3.14159265358979323846 / 180.0; // angleY
+  }
+  
+  // Chuẩn hóa
+  float normalized_buffer[TIME_STEPS][N_FEATURES];
   for (int i = 0; i < TIME_STEPS; i++) {
     for (int j = 0; j < N_FEATURES; j++) {
-      int8_t q = (int8_t)(sequence_buffer[i][j] / input->params.scale + input->params.zero_point);
+      float scaled = (sequence_buffer[i][j] - feature_mins[j]) / (feature_maxs[j] - feature_mins[j]);
+      if (scaled < 0) scaled = 0;
+      if (scaled > 1) scaled = 1;
+      normalized_buffer[i][j] = scaled;
+    }
+  }
+
+  // Float -> int8
+  for (int i = 0; i < TIME_STEPS; i++) {
+    for (int j = 0; j < N_FEATURES; j++) {
+      int8_t q = (int8_t)(normalized_buffer[i][j] / input->params.scale + input->params.zero_point);
       if (q > 127) q = 127;
       if (q < -128) q = -128;
       input->data.int8[i * N_FEATURES + j] = q;
@@ -117,21 +156,29 @@ void process_sequence(float nodeId, float temp, float accX, float accY, float ac
     return;
   }
 
+  memcpy(sequence_buffer, normalized_buffer, sizeof(normalized_buffer));
   float mse = compute_mse();
-  bool alert = mse > MSE_THRESHOLD;
+
+  // --- Calibrate ---
+  if (calibrating) {
+    if (mse > max_mse_normal) max_mse_normal = mse;
+  }
+
+  bool alert = false;
+  if (!calibrating) alert = mse > MSE_THRESHOLD;
 
   // Rung motor nếu cảnh báo
   digitalWrite(MOTOR_PIN, alert ? HIGH : LOW);
   if (alert) Serial.println("ALERT: Anomaly detected!");
 
-  // --- Publish lên ThingSpeak ---
+  // --- Publish dữ liệu ---
   String topic = "channels/" + String(channelID) + "/publish";
   String payload = "field1=" + String(nodeId) +
-                   "&field2=" + String(temp, 2) +
-                   "&field3=" + String(accX, 2) + "," + String(accY, 2) + "," + String(accZ, 2) +
-                   "&field4=" + String(gyroX, 2) + "," + String(gyroY, 2) + "," + String(gyroZ, 2) +
-                   "&field5=" + String(angleX, 2) + "," + String(angleY, 2) + "," + String(angleZ, 2) +
-                   "&field6=" + String(hr, 0) +
+                   "&field2=" + String(raw_values[0], 2) +
+                   "&field3=" + String(raw_values[1], 2) + "," + String(raw_values[2], 2) + "," + String(raw_values[3], 2) +
+                   "&field4=" + String(raw_values[4], 2) + "," + String(raw_values[5], 2) + "," + String(raw_values[6], 2) +
+                   "&field5=" + String(raw_values[7], 2) + "," + String(raw_values[8], 2) + "," + String(raw_values[9], 2) +
+                   "&field6=" + String(raw_values[10], 0) +
                    "&field7=" + String(mse, 6) +
                    "&field8=" + String(alert ? 1 : 0);
 
@@ -166,14 +213,27 @@ void setup() {
 
   // TFLite
   setupTFLite();
+
+  // Bắt đầu calibrate
+  calibrate_start = millis();
+  Serial.println("Calibration started: collecting normal data for MSE threshold...");
 }
 
 void loop() {
   if (!client.connected()) reconnectMQTT();
   client.loop();
 
-  int packetSize = udp.parsePacket();
-  if (packetSize) {
+  // --- Kiểm tra kết thúc calibrate ---
+  if (calibrating && millis() - calibrate_start > 120000) { // 2 phút
+    calibrating = false;
+    Serial.print("Calibration done. Max MSE observed: ");
+    Serial.println(max_mse_normal, 6);
+    MSE_THRESHOLD = max_mse_normal * 1.1; // threshold = max MSE * 1.1
+    Serial.print("Set new MSE threshold: ");
+    Serial.println(MSE_THRESHOLD, 6);
+  }
+
+  int packetSize = udp.parsePacket();  if (packetSize) {
     char packetBuffer[255];
     int len = udp.read(packetBuffer, 255);
     if (len > 0) packetBuffer[len] = '\0';
@@ -193,15 +253,16 @@ void loop() {
       }
     }
 
-    // Add to sequence buffer
+    // Lưu dữ liệu thô vào buffer
     for (int j = 0; j < N_FEATURES; j++) {
-      sequence_buffer[seq_index][j] = values[j + 1]; // skip nodeId
+      sequence_buffer[seq_index][j] = values[j + 1];
     }
     seq_index++;
 
     if (seq_index >= TIME_STEPS) {
-      process_sequence(values[0], values[1], values[2], values[3], values[4],
-                       values[5], values[6], values[7], values[8], values[9], values[10], values[11]);
+      float raw_vals[N_FEATURES];
+      for (int j = 0; j < N_FEATURES; j++) raw_vals[j] = values[j + 1];
+      process_sequence(values[0], raw_vals);
 
       // shift left buffer 1 step
       for (int i = 1; i < TIME_STEPS; i++)

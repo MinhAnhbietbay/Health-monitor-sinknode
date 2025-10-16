@@ -4,8 +4,6 @@
 #include <PubSubClient.h>
 
 #include "dense_autoencoder_esp32_int8.h"
-
-// TensorFlow Lite for Microcontrollers
 #include <tensorflow/lite/micro/all_ops_resolver.h>
 #include <tensorflow/lite/micro/micro_interpreter.h>
 #include <tensorflow/lite/micro/micro_error_reporter.h>
@@ -29,6 +27,7 @@ const char* channelID    = "3111657";
 const int udpPort = 8888;
 WiFiUDP udp;
 
+// --- MQTT client ---
 WiFiClientSecure espClient;
 PubSubClient client(espClient);
 
@@ -47,7 +46,7 @@ TfLiteTensor* output;
 // --- Parameters ---
 #define TIME_STEPS 10
 #define N_FEATURES 11
-const float MSE_THRESHOLD = 0.0008969453; // theo mse_threshold_95.npy
+const float MSE_THRESHOLD = 0.0008969453;
 
 float sequence_buffer[TIME_STEPS][N_FEATURES];
 int seq_index = 0;
@@ -99,7 +98,10 @@ float compute_mse() {
   return mse;
 }
 
-void process_sequence() {
+void process_sequence(float nodeId, float temp, float accX, float accY, float accZ,
+                      float gyroX, float gyroY, float gyroZ,
+                      float angleX, float angleY, float angleZ,
+                      float hr) {
   // Convert float -> int8 input
   for (int i = 0; i < TIME_STEPS; i++) {
     for (int j = 0; j < N_FEATURES; j++) {
@@ -116,17 +118,27 @@ void process_sequence() {
   }
 
   float mse = compute_mse();
-  Serial.printf("Sequence MSE: %.6f\n", mse);
+  bool alert = mse > MSE_THRESHOLD;
 
-  if (mse > MSE_THRESHOLD) {
-    digitalWrite(MOTOR_PIN, HIGH);
-    Serial.println("ALERT: Anomaly detected!!!!!!!!!!!");
-    // Publish alert
-    String topic = "channels/" + String(channelID) + "/publish";
-    String payload = "field1=ALERT&field2=" + String(mse);
-    client.publish(topic.c_str(), payload.c_str());
+  // Rung motor nếu cảnh báo
+  digitalWrite(MOTOR_PIN, alert ? HIGH : LOW);
+  if (alert) Serial.println("ALERT: Anomaly detected!");
+
+  // --- Publish lên ThingSpeak ---
+  String topic = "channels/" + String(channelID) + "/publish";
+  String payload = "field1=" + String(nodeId) +
+                   "&field2=" + String(temp, 2) +
+                   "&field3=" + String(accX, 2) + "," + String(accY, 2) + "," + String(accZ, 2) +
+                   "&field4=" + String(gyroX, 2) + "," + String(gyroY, 2) + "," + String(gyroZ, 2) +
+                   "&field5=" + String(angleX, 2) + "," + String(angleY, 2) + "," + String(angleZ, 2) +
+                   "&field6=" + String(hr, 0) +
+                   "&field7=" + String(mse, 6) +
+                   "&field8=" + String(alert ? 1 : 0);
+
+  if (client.publish(topic.c_str(), payload.c_str())) {
+    Serial.println("Published: " + payload);
   } else {
-    digitalWrite(MOTOR_PIN, LOW);
+    Serial.println("Publish failed!");
   }
 }
 
@@ -188,7 +200,9 @@ void loop() {
     seq_index++;
 
     if (seq_index >= TIME_STEPS) {
-      process_sequence();
+      process_sequence(values[0], values[1], values[2], values[3], values[4],
+                       values[5], values[6], values[7], values[8], values[9], values[10], values[11]);
+
       // shift left buffer 1 step
       for (int i = 1; i < TIME_STEPS; i++)
         for (int j = 0; j < N_FEATURES; j++)
